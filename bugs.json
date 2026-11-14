@@ -1,0 +1,6 @@
+[
+  {"fn": "factorial", "input": 5, "expected": 120},
+  {"fn": "countVowels", "input": "AEIOU", "expected": 5},
+  {"fn": "reverse", "input": "a😀b", "expected": "b😀a"},
+  {"fn": "isPalindrome", "input": "😀a😀", "expected": true}
+]
