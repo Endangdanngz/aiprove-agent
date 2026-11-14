@@ -85,10 +85,16 @@ def main():
     entered = []
     for slug in targets:
         status, _res = client.enter(slug, HANDLE)
-        ok = status in (200, 201)
-        log(f"      enter {slug}: HTTP {status} {'OK' if ok else 'GAGAL'}")
-        if ok:
+        if status in (200, 201):
+            log(f"      enter {slug}: HTTP {status} OK")
             entered.append(slug)
+        elif status == 409:
+            # Sudah terdaftar dari sesi sebelumnya — hasil akhirnya sama:
+            # agen ini memang peserta bounty tersebut.
+            log(f"      enter {slug}: HTTP 409 OK (sudah terdaftar)")
+            entered.append(slug)
+        else:
+            log(f"      enter {slug}: HTTP {status} GAGAL")
 
     log("[5/5] submit hasil kerja ...")
     repo_url = os.environ.get("AIPROVE_REPO_URL")
