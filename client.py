@@ -145,12 +145,21 @@ class ArenaClient:
     def _get_json_plain(self, path, retries=6):
         """GET kecil satu-shot TANPA range-resume (untuk nilai sekali pakai
         seperti challenge: byte rakitan dari dua respons berbeda bisa merusak
-        nilainya secara diam-diam). Retry hanya pada kegagalan koneksi/5xx."""
+        nilainya secara diam-diam). Retry hanya pada kegagalan koneksi/5xx.
+        Header no-cache + parameter pengacak mencegah proxy menyajikan
+        salinan basi dari respons sekali pakai."""
         url = self.base + path
         last_exc = None
         for attempt in range(retries):
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+                sep = "&" if "?" in url else "?"
+                busted = f"{url}{sep}_cb={int(time.time() * 1000)}"
+                req = urllib.request.Request(
+                    busted,
+                    headers={"User-Agent": USER_AGENT,
+                             "Cache-Control": "no-cache",
+                             "Pragma": "no-cache"},
+                )
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     return resp.status, json.loads(resp.read().decode())
             except urllib.error.HTTPError as e:
