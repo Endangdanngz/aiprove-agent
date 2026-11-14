@@ -34,11 +34,14 @@ class ArenaClient:
         self.address = None
 
     # ------------------------------------------------------------------ HTTP
-    def _resume_bytes(self, url, headers, max_rounds=20):
+    def _resume_bytes(self, url, headers, max_rounds=24):
         """Unduh satu body respons GET secara utuh dengan range-resume.
 
         Koneksi boleh putus di tengah: byte yang sudah diterima disimpan dan
-        sisanya diminta dengan header Range. Mengembalikan (status, bytes).
+        sisanya diminta dengan header Range. Respons 200 selalu berarti
+        "seluruh body dari byte 0" (server mengabaikan Range), jadi isinya
+        MENGGANTIKAN buffer — potongan parsialnya tetap awalan yang sah.
+        Respons 206 DITAMBAHKAN ke buffer. Mengembalikan (status, bytes).
         """
         buf = b""
         total = None
@@ -52,16 +55,19 @@ class ArenaClient:
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     status = resp.status
                     if resp.status == 200:
-                        clen = int(resp.headers.get("Content-Length") or 0)
-                        if buf and clen and total and clen != total:
-                            buf = b""  # server mengabaikan Range; mulai ulang
-                        total = clen or total
-                        buf += resp.read()
+                        total = int(resp.headers.get("Content-Length") or 0) or total
+                        try:
+                            buf = resp.read()
+                        except http.client.IncompleteRead as e:
+                            buf = e.partial
                     else:  # 206 Partial Content
                         crange = resp.headers.get("Content-Range", "")
                         if "/" in crange:
                             total = int(crange.rsplit("/", 1)[1])
-                        buf += resp.read()
+                        try:
+                            buf += resp.read()
+                        except http.client.IncompleteRead as e:
+                            buf += e.partial
             except urllib.error.HTTPError as e:
                 raw = e.read()
                 if e.code >= 500:
@@ -69,7 +75,7 @@ class ArenaClient:
                     continue
                 return e.code, raw
             except http.client.IncompleteRead as e:
-                buf += e.partial
+                buf = e.partial if status == 200 else buf + e.partial
             except Exception:
                 time.sleep(1.5)  # putus sebelum/di tengah respons; resume lagi
             if total is not None and len(buf) >= total:
@@ -89,12 +95,17 @@ class ArenaClient:
                 raise ArenaError("belum terautentikasi")
             headers["Authorization"] = "Bearer " + self.token
         if method == "GET" and body is None:
-            status, raw = self._resume_bytes(url, headers)
-            text = raw.decode(errors="replace")
-            try:
-                return status, json.loads(text)
-            except json.JSONDecodeError:
-                return status, {"raw": text}
+            # Isi daftar bisa berubah antar-request (penghitung berjalan),
+            # jadi rakitan byte divalidasi sebagai JSON; bila tidak valid,
+            # ulangi pengambilan dari awal.
+            for _round in range(3):
+                status, raw = self._resume_bytes(url, headers)
+                text = raw.decode(errors="replace")
+                try:
+                    return status, json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+            return status, {"raw": text}
         data = None
         if body is not None:
             data = json.dumps(body).encode()
@@ -126,35 +137,10 @@ class ArenaClient:
                     continue
         raise ArenaError(f"request gagal setelah {retries} percobaan: {method} {path}: {last_exc}")
 
-    def fetch_text(self, path, max_rounds=16):
-        """Unduh teks dengan range-resume sampai lengkap sesuai Content-Length."""
-        url = self.base + path
-        buf = b""
-        total = None
-        for _ in range(max_rounds):
-            headers = {"User-Agent": USER_AGENT}
-            if buf:
-                headers["Range"] = f"bytes={len(buf)}-"
-            req = urllib.request.Request(url, headers=headers)
-            try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    if resp.status == 200:
-                        total = int(resp.headers.get("Content-Length") or 0) or total
-                        if buf and int(resp.headers.get("Content-Length") or 0) != (total or 0):
-                            buf = b""  # server mengabaikan Range; mulai ulang dari respons ini
-                        buf += resp.read()
-                    else:  # 206 Partial Content
-                        crange = resp.headers.get("Content-Range", "")
-                        if "/" in crange:
-                            total = int(crange.rsplit("/", 1)[1])
-                        buf += resp.read()
-            except http.client.IncompleteRead as e:
-                buf += e.partial
-            except Exception:
-                time.sleep(1.5)  # koneksi putus; byte yang ada dipertahankan, lanjut resume
-            if total is not None and len(buf) >= total:
-                return buf.decode()
-        raise ArenaError(f"gagal mengunduh {path} secara utuh ({len(buf)}/{total} byte)")
+    def fetch_text(self, path):
+        """Unduh teks (statis, mis. skill.md) secara utuh via range-resume."""
+        _status, raw = self._resume_bytes(self.base + path, {"User-Agent": USER_AGENT})
+        return raw.decode()
 
     # ------------------------------------------------------------------ Auth
     def authenticate(self, account):
@@ -191,21 +177,15 @@ class ArenaClient:
         return self.request("POST", f"/api/bounties/{slug}/submit", body, auth=True)
 
     def submit_bughunt(self, slug, bugs, transcript, handle):
-        """Kirim laporan bug. Bentuk payload dicoba dari yang paling lengkap;
-        HTTP 400 berarti bentuk ditolak dan TIDAK ada submission yang dibuat,
-        jadi aman mencoba bentuk berikutnya."""
-        attempts = [
-            {"bugs": bugs, "handle": handle, "transcript": transcript},
-            {"bugs": bugs, "handle": handle},
-            {"bugs": bugs},
-            {"reports": bugs, "handle": handle, "transcript": transcript},
-            bugs,  # terakhir: body berupa JSON list mentah
-        ]
-        for i, body in enumerate(attempts, 1):
-            status, res = self.request("POST", f"/api/bounties/{slug}/submit", body, auth=True)
-            self.log(f"      submit {slug} percobaan-{i}: HTTP {status}")
-            if status != 400:
-                return status, res
+        """Kirim laporan bug. Untuk bounty jenis bughunt, daftar laporan
+        [{fn, input, expected}] dibungkus di field `prediction` (kontrak ini
+        tidak tertulis di skill.md; terkonfirmasi dari jawaban API)."""
+        body = {"prediction": bugs, "handle": handle, "transcript": transcript}
+        status, res = self.request("POST", f"/api/bounties/{slug}/submit", body, auth=True)
+        if status == 400:  # cadangan: tanpa transcript
+            status, res = self.request(
+                "POST", f"/api/bounties/{slug}/submit", {"prediction": bugs, "handle": handle}, auth=True
+            )
         return status, res
 
     def me(self):

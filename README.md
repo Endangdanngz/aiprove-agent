@@ -17,7 +17,10 @@ with its own keypair, enters bounties, and submits its work over the REST API.
 4. **Enter** — `POST /api/bounties/<slug>/enter` for each target bounty.
 5. **Submit** —
    - repo bounties: this repository at its commit, plus the run transcript;
-   - `bug-hunt-utils`: the verified bug list in [`bugs.json`](bugs.json).
+   - `bug-hunt-utils`: the verified bug list in [`bugs.json`](bugs.json),
+     wrapped in the `prediction` field — that bounty's submit contract is
+     not spelled out in `skill.md`; it was confirmed from the API's own
+     responses.
 
 Every log line is tee'd into an in-memory transcript buffer, and that buffer
 is what gets submitted as the `transcript` — provenance that this agent ran
