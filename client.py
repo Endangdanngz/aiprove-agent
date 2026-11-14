@@ -142,25 +142,61 @@ class ArenaClient:
         _status, raw = self._resume_bytes(self.base + path, {"User-Agent": USER_AGENT})
         return raw.decode()
 
+    def _get_json_plain(self, path, retries=6):
+        """GET kecil satu-shot TANPA range-resume (untuk nilai sekali pakai
+        seperti challenge: byte rakitan dari dua respons berbeda bisa merusak
+        nilainya secara diam-diam). Retry hanya pada kegagalan koneksi/5xx."""
+        url = self.base + path
+        last_exc = None
+        for attempt in range(retries):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return resp.status, json.loads(resp.read().decode())
+            except urllib.error.HTTPError as e:
+                raw = e.read().decode(errors="replace")
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    payload = {"raw": raw}
+                if e.code >= 500 and attempt < retries - 1:
+                    time.sleep(2 ** attempt + 1)
+                    continue
+                return e.code, payload
+            except Exception as e:
+                last_exc = e
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt + 1)
+                    continue
+        raise ArenaError(f"GET {path} gagal setelah {retries} percobaan: {last_exc}")
+
     # ------------------------------------------------------------------ Auth
     def authenticate(self, account):
-        """Handshake keypair: challenge -> EIP-191 sign -> verify -> sesi."""
+        """Handshake keypair: challenge -> EIP-191 sign -> verify -> sesi.
+
+        Challenge selalu diambil segar lewat GET satu-shot dan tidak pernah
+        dipakai ulang; bila verify menjawab 401, ulangi sekali dengan
+        challenge baru."""
         self.address = account.address
-        status, ch = self.request("GET", f"/api/auth/challenge?address={self.address}")
-        if status != 200 or not ch.get("challenge"):
-            raise ArenaError(f"challenge gagal: HTTP {status}")
-        self.log(f"      challenge: HTTP {status}")
-        signature = account.sign_message(encode_defunct(text=ch["challenge"])).signature.hex()
-        if not signature.startswith("0x"):
-            signature = "0x" + signature
-        status, res = self.request(
-            "POST", "/api/auth/verify", {"address": self.address, "signature": signature}
-        )
-        if status != 200 or not res.get("token"):
-            raise ArenaError(f"verify gagal: HTTP {status}")
-        self.token = res["token"]
-        self.log(f"      verify: HTTP {status} (token sesi diterima, tidak dicetak)")
-        return res
+        for attempt in (1, 2):
+            status, ch = self._get_json_plain(f"/api/auth/challenge?address={self.address}")
+            if status != 200 or not ch.get("challenge"):
+                raise ArenaError(f"challenge gagal: HTTP {status}")
+            self.log(f"      challenge: HTTP {status} (percobaan {attempt})")
+            signature = account.sign_message(encode_defunct(text=ch["challenge"])).signature.hex()
+            if not signature.startswith("0x"):
+                signature = "0x" + signature
+            status, res = self.request(
+                "POST", "/api/auth/verify", {"address": self.address, "signature": signature}
+            )
+            if status == 200 and res.get("token"):
+                self.token = res["token"]
+                self.log(f"      verify: HTTP {status} (token sesi diterima, tidak dicetak)")
+                return res
+            if status != 401:
+                break
+            self.log("      verify: HTTP 401 — ambil challenge segar dan coba lagi")
+        raise ArenaError(f"verify gagal: HTTP {status}")
 
     # ---------------------------------------------------------------- Arena
     def list_open_bounties(self):
