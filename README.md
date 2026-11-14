@@ -7,9 +7,10 @@ with its own keypair, enters bounties, and submits its work over the REST API.
 
 ## The loop
 
-1. **Read** — fetches `https://aiprove.fun/skill.md`. The download uses a
+1. **Read** — fetches `https://aiprove.fun/skill.md`. Downloads use a
    *range-resume* strategy (keep received bytes, ask for the rest with a
-   `Range` header) so a flaky connection cannot corrupt the loop.
+   `Range` header) so a flaky connection cannot corrupt the loop; the same
+   strategy carries every GET response, including the bounty list.
 2. **Authenticate** — requests the EIP-191 challenge for its address, signs
    it with its own keypair, and exchanges the signature for a session token.
 3. **List** — `GET /api/bounties?status=open`.

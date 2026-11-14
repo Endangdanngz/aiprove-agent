@@ -34,18 +34,71 @@ class ArenaClient:
         self.address = None
 
     # ------------------------------------------------------------------ HTTP
+    def _resume_bytes(self, url, headers, max_rounds=20):
+        """Unduh satu body respons GET secara utuh dengan range-resume.
+
+        Koneksi boleh putus di tengah: byte yang sudah diterima disimpan dan
+        sisanya diminta dengan header Range. Mengembalikan (status, bytes).
+        """
+        buf = b""
+        total = None
+        status = None
+        for _ in range(max_rounds):
+            h = dict(headers)
+            if buf:
+                h["Range"] = f"bytes={len(buf)}-"
+            req = urllib.request.Request(url, headers=h, method="GET")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    status = resp.status
+                    if resp.status == 200:
+                        clen = int(resp.headers.get("Content-Length") or 0)
+                        if buf and clen and total and clen != total:
+                            buf = b""  # server mengabaikan Range; mulai ulang
+                        total = clen or total
+                        buf += resp.read()
+                    else:  # 206 Partial Content
+                        crange = resp.headers.get("Content-Range", "")
+                        if "/" in crange:
+                            total = int(crange.rsplit("/", 1)[1])
+                        buf += resp.read()
+            except urllib.error.HTTPError as e:
+                raw = e.read()
+                if e.code >= 500:
+                    time.sleep(1.5)
+                    continue
+                return e.code, raw
+            except http.client.IncompleteRead as e:
+                buf += e.partial
+            except Exception:
+                time.sleep(1.5)  # putus sebelum/di tengah respons; resume lagi
+            if total is not None and len(buf) >= total:
+                return status or 200, buf
+        raise ArenaError(f"unduhan tidak utuh setelah {max_rounds} ronde: {url} ({len(buf)}/{total})")
+
     def request(self, method, path, body=None, auth=False, retries=4):
-        """Request JSON dengan retry. Mengembalikan (status, payload)."""
+        """Request JSON dengan retry. Mengembalikan (status, payload).
+
+        GET dibaca lewat jalur range-resume (respons daftar bisa belasan KB
+        dan koneksi tidak selalu stabil); POST memakai retry biasa karena
+        responsnya kecil."""
         url = self.base + path
-        data = None
         headers = {"User-Agent": USER_AGENT}
-        if body is not None:
-            data = json.dumps(body).encode()
-            headers["Content-Type"] = "application/json"
         if auth:
             if not self.token:
                 raise ArenaError("belum terautentikasi")
             headers["Authorization"] = "Bearer " + self.token
+        if method == "GET" and body is None:
+            status, raw = self._resume_bytes(url, headers)
+            text = raw.decode(errors="replace")
+            try:
+                return status, json.loads(text)
+            except json.JSONDecodeError:
+                return status, {"raw": text}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
         last_exc = None
         for attempt in range(retries):
             try:
